@@ -54,8 +54,10 @@ def find_seq_idx(
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
-    key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
-    value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+    key_cache_ptr,  # NHD: [num_blks, blk_size, num_kv_heads, head_size]
+    # SHUFFLE: [num_blks, num_kv_heads, head_size // X, blk_size, X]
+    value_cache_ptr,  # NHD: [num_blks, blk_size, num_kv_heads, head_size]
+    # SHUFFLE: [num_blks, num_kv_heads, blk_size // X, head_size, X]
     sink_ptr,  # [num_query_heads]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
@@ -84,7 +86,7 @@ def kernel_unified_attention_2d(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
-    stride_k_cache_0: tl.int64,  # int
+    stride_k_cache_0: tl.int64,  # int (only used when KV_CACHE_LAYOUT == "NHD")
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
     stride_k_cache_3: tl.constexpr,  # int
@@ -99,6 +101,8 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
+    KV_CACHE_LAYOUT: tl.constexpr = "NHD",  # "NHD" or "SHUFFLE"
+    X: tl.constexpr = 1,  # 16 // kv_cache.element_size(); only used for SHUFFLE
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -256,19 +260,52 @@ def kernel_unified_attention_2d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+        if KV_CACHE_LAYOUT == "SHUFFLE":
+            # SHUFFLE layout (mirrors cp_mha_gather_cache_kernel SHUFFLE arm):
+            #   K cache: [num_blocks, num_kv_heads, head_size // X, BLOCK_SIZE, X]
+            #   V cache: [num_blocks, num_kv_heads, BLOCK_SIZE // X, head_size, X]
+            # Strides (in element units, NOT bytes; matches NHD ptr arithmetic):
+            #   per-block      = num_kv_heads * HEAD_SIZE * BLOCK_SIZE
+            #   per-kv-head    = HEAD_SIZE * BLOCK_SIZE
+            # K element at (block, head, c, slot) =
+            #   block*per_block + head*per_head
+            #   + (c // X) * BLOCK_SIZE * X + slot * X + (c % X)
+            # V element at (block, head, slot, c) =
+            #   block*per_block + head*per_head
+            #   + (slot // X) * HEAD_SIZE * X + c * X + (slot % X)
+            NUM_KV_HEADS_C: tl.constexpr = num_query_heads // num_queries_per_kv
+            STRIDE_PER_BLOCK_C: tl.constexpr = NUM_KV_HEADS_C * HEAD_SIZE * BLOCK_SIZE
+            STRIDE_PER_HEAD_C: tl.constexpr = HEAD_SIZE * BLOCK_SIZE
+            slot_in_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            k_offset = (
+                physical_block_idx[None, :] * STRIDE_PER_BLOCK_C
+                + kv_head_idx * STRIDE_PER_HEAD_C
+                + (offs_d // X)[:, None] * (BLOCK_SIZE * X)
+                + slot_in_block[None, :] * X
+                + (offs_d % X)[:, None]
+            )
+            v_offset = (
+                physical_block_idx[:, None] * STRIDE_PER_BLOCK_C
+                + kv_head_idx * STRIDE_PER_HEAD_C
+                + (slot_in_block // X)[:, None] * (HEAD_SIZE * X)
+                + offs_d[None, :] * X
+                + (slot_in_block % X)[:, None]
+            )
+        else:
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
@@ -388,8 +425,10 @@ def kernel_unified_attention_3d(
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
-    key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
-    value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+    key_cache_ptr,  # NHD: [num_blks, blk_size, num_kv_heads, head_size]
+    # SHUFFLE: [num_blks, num_kv_heads, head_size // X, blk_size, X]
+    value_cache_ptr,  # NHD: [num_blks, blk_size, num_kv_heads, head_size]
+    # SHUFFLE: [num_blks, num_kv_heads, blk_size // X, head_size, X]
     sink_ptr,  # [num_query_heads]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
@@ -415,7 +454,7 @@ def kernel_unified_attention_3d(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
-    stride_k_cache_0: tl.int64,  # int
+    stride_k_cache_0: tl.int64,  # int (only used when KV_CACHE_LAYOUT == "NHD")
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
     stride_k_cache_3: tl.constexpr,  # int
@@ -429,6 +468,8 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
+    KV_CACHE_LAYOUT: tl.constexpr = "NHD",  # "NHD" or "SHUFFLE"
+    X: tl.constexpr = 1,  # 16 // kv_cache.element_size(); only used for SHUFFLE
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -574,19 +615,41 @@ def kernel_unified_attention_3d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+        if KV_CACHE_LAYOUT == "SHUFFLE":
+            # See kernel_unified_attention_2d for the SHUFFLE layout note.
+            NUM_KV_HEADS_C: tl.constexpr = num_query_heads // num_queries_per_kv
+            STRIDE_PER_BLOCK_C: tl.constexpr = NUM_KV_HEADS_C * HEAD_SIZE * BLOCK_SIZE
+            STRIDE_PER_HEAD_C: tl.constexpr = HEAD_SIZE * BLOCK_SIZE
+            slot_in_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            k_offset = (
+                physical_block_idx[None, :] * STRIDE_PER_BLOCK_C
+                + kv_head_idx * STRIDE_PER_HEAD_C
+                + (offs_d // X)[:, None] * (BLOCK_SIZE * X)
+                + slot_in_block[None, :] * X
+                + (offs_d % X)[:, None]
+            )
+            v_offset = (
+                physical_block_idx[:, None] * STRIDE_PER_BLOCK_C
+                + kv_head_idx * STRIDE_PER_HEAD_C
+                + (slot_in_block // X)[:, None] * (HEAD_SIZE * X)
+                + offs_d[None, :] * X
+                + (slot_in_block % X)[:, None]
+            )
+        else:
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(

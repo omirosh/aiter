@@ -133,8 +133,42 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    # KV-cache memory layout. "NHD" (default) treats `k` and `v` as the
+    # standard `[num_blocks, page_size, num_kv_heads, head_size]` paged
+    # cache with strides taken from the tensors. "SHUFFLE" reinterprets
+    # them as the AMD MFMA-friendly layout
+    #   K: [num_blocks, num_kv_heads, head_size // x, page_size, x]
+    #   V: [num_blocks, num_kv_heads, page_size // x, head_size, x]
+    # where `x = 16 // kv_cache.element_size()`. The kernel computes
+    # SHUFFLE addresses internally; the strides of `k`/`v` are ignored
+    # in that path. This mirrors `cp_mha_gather_cache_kernel`'s SHUFFLE
+    # arm and is intended for vLLM's `VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT`
+    # path.
+    kv_cache_layout="NHD",
 ):
     assert causal, "Only causal attention is supported"
+    assert kv_cache_layout in ("NHD", "SHUFFLE"), (
+        f"unified_attention: kv_cache_layout must be 'NHD' or 'SHUFFLE', "
+        f"got {kv_cache_layout!r}"
+    )
+    # `x` is computed from kv element size and only used by the SHUFFLE
+    # arm of the kernels. For NHD it's a no-op constant.
+    if kv_cache_layout == "SHUFFLE":
+        x_kv = 16 // k.element_size()
+        # Sanity: SHUFFLE V layout requires page_size to be a multiple
+        # of x (so that the (slot // x, slot % x) split is exact). Same
+        # constraint as the SHUFFLE write/gather kernels.
+        block_size_kv = v.shape[1]
+        assert block_size_kv % x_kv == 0, (
+            f"SHUFFLE layout requires page_size ({block_size_kv}) "
+            f"divisible by x={x_kv}"
+        )
+        assert k.shape[3] % x_kv == 0, (
+            f"SHUFFLE layout requires head_size ({k.shape[3]}) divisible "
+            f"by x={x_kv}"
+        )
+    else:
+        x_kv = 1
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -170,7 +204,19 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
     # if batch contains a prefill
-    if use_2d_kernel(
+    # SHUFFLE-layout diagnostic: the 2d kernel's SHUFFLE arm trips a
+    # GPU memory-access fault on lm_eval gsm8k (max_seqlen_k <= 512
+    # routes through use_2d_kernel(...) = True; bench-serve at
+    # ISL=1000 always landed on the 3d kernel, which is clean). The
+    # in-kernel address arithmetic and the partial-tile masking
+    # behavior have both been audited without finding a smoking gun.
+    # As a *temporary* probe, force SHUFFLE+verify off the 2d kernel
+    # entirely so we can localize the fault to the 2d arm vs. some
+    # other kernel-selection-independent issue. If lm_eval clears
+    # under this branch, the bug is 2d-arm-specific. If it still
+    # faults, it's elsewhere (drafter dispatch, async-spec, etc.).
+    force_3d = kv_cache_layout == "SHUFFLE"
+    if not force_3d and use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -240,6 +286,8 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             ALL_DECODE=ALL_DECODE,
+            KV_CACHE_LAYOUT=kv_cache_layout,
+            X=x_kv,
             **config,
         )
 
@@ -320,6 +368,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            KV_CACHE_LAYOUT=kv_cache_layout,
+            X=x_kv,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
