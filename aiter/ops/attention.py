@@ -217,6 +217,8 @@ def paged_attention_common(
     kernelName: Optional[str] = None,
     kv_cache_dtype: str = "auto",
     kv_cache_tensor_dtype: Optional[torch.dtype] = None,
+    mtp: int = 1,
+    force_hip: bool = False,
 ) -> torch.Tensor:
     """
     Paged attention forward pass with automatic kernel selection.
@@ -224,13 +226,26 @@ def paged_attention_common(
     the heuristic thresholds for larger ctx_len values.
     PA is normally using per tensor quant and this is what has been tested, however,
     per head quant can be supported as well in principle, but not tested.
+
+    Multi-token decode (MTP) extension:
+      - `mtp` is the per-seq query length for the HIP arm. The HIP
+        kernel `paged_attention_ll4mi_QKV_mfma16_kernel` is templated
+        on `int MTP` and iterates over `MTP_PER_THREAD` query tokens
+        internally (see `csrc/cpp_itfs/pa/pa.cuh:189`). Default 1
+        preserves the q=1 single-token decode behaviour.
+      - `force_hip=True` skips the ASM-eligibility heuristic and
+        routes to the HIP arm regardless of mc. This is needed when
+        the caller wants the HIP MTP kernel for high-mc shapes too
+        (e.g. `vllm` `VLLM_ROCM_QLEN_HIP=1` for q>1 MTP, where the
+        ASM catalog only has Mtp=1 binaries — Mtp>=2 shapes have no
+        ASM binary and must go through HIP).
     """
     kv_cache_tensor_dtype = (
         kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else K.dtype
     )
     num_seqs, num_heads, head_size = Q.shape
 
-    use_asm_kernel = _should_use_asm_kernel(
+    use_asm_kernel = (not force_hip) and _should_use_asm_kernel(
         num_seqs, num_heads, head_size, kv_cache_tensor_dtype, high_precision
     )
 
@@ -275,7 +290,7 @@ def paged_attention_common(
         v_scale=V_QScale_hip,
         fp8_out_scale=None,
         partition_size=256,
-        mtp=1,
+        mtp=mtp,
         q_scale=None,
     )
     return output
