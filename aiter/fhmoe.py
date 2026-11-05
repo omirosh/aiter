@@ -693,7 +693,6 @@ def _supports_mxfp8_fhmoe_config(
             max_tokens,
             model_dim,
             force_reduce=force_reduce,
-            stage2_fp8=stage2_fp8,
         ):
             output_element_size = torch.empty((), dtype=dtype).element_size()
             if (

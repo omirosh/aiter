@@ -944,7 +944,6 @@ def _stage2_runtime_uses_route_reduce(
     model_dim: int,
     *,
     force_reduce: bool | None = None,
-    stage2_fp8: bool | None = None,
 ) -> bool:
     """Return the effective route-output mode used by stage2 at runtime."""
     if stage2_uses_route_reduce(stage2):
@@ -959,10 +958,8 @@ def _stage2_runtime_uses_route_reduce(
         token_num,
         model_dim,
         2,
-        parsed.get("b_dtype", ""),
         False,
         force_reduce=force_reduce,
-        stage2_fp8=stage2_fp8,
     )
     return mode == "reduce"
 

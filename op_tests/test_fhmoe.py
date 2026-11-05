@@ -1767,7 +1767,7 @@ def test_flydsl_stage2_classification_covers_plain_and_fhmoe_wrappers(
     monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8", raising=False)
     assert not fused_moe_module._stage2_runtime_uses_route_reduce(fp8_stage2, 1, 6144)
     monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
-    assert fused_moe_module._stage2_runtime_uses_route_reduce(fp8_stage2, 1, 6144)
+    assert not fused_moe_module._stage2_runtime_uses_route_reduce(fp8_stage2, 1, 6144)
     bf16_route_bytes = 50000 * 9 * 6144 * 2
     fp8_route_bytes = fused_moe_module._flydsl_route_output_nbytes(
         fp8_stage2,

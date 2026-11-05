@@ -117,19 +117,18 @@ def resolve_flydsl_stage2_mode(
     token_num: int,
     model_dim: int,
     element_size: int,
-    b_dtype: str,
     return_per_slot: bool,
     *,
     force_reduce: bool | None = None,
-    stage2_fp8: bool | None = None,
 ) -> str:
-    """Resolve runtime reduce overrides shared by sorting and stage 2."""
+    """Resolve runtime reduce overrides shared by sorting and stage 2.
+
+    AITER_FLYDSL_STAGE2_FP8 only sets the output format of reduce rows; the
+    tuned mode stands, because the tuners measure with the switch off.
+    """
     if force_reduce is None:
         force_reduce = os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
-    if stage2_fp8 is None:
-        stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    fp8_reduce = stage2_fp8 and b_dtype in ("fp4", "fp8") and not return_per_slot
-    if force_reduce or fp8_reduce:
+    if force_reduce:
         return "reduce"
     if (
         mode != "reduce"
@@ -2255,7 +2254,6 @@ def _flydsl_moe_stage2_impl(
         token_num,
         model_dim,
         2,
-        b_dtype,
         return_per_slot,
     )
 
